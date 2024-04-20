@@ -8,9 +8,9 @@ pub mod inst;
 mod error;
 mod optimizer;
 mod prepass;
-mod translate;
-mod translate_id;
+//mod translate;
 mod aarch64;
+mod translate_id;
 
 struct AddressInstDecoder {
     addr: *const u32,

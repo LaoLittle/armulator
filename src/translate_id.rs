@@ -4,9 +4,9 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::OnceLock;
 
+use crate::AddressInstDecoder;
 use cranelift::codegen::ir::UserFuncName;
 use cranelift::codegen::settings;
-use cranelift::frontend::FuncInstBuilder;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, DataDescription, DataId, Module};
@@ -15,7 +15,6 @@ use smallvec::SmallVec;
 use yaxpeax_arm::armv8;
 use yaxpeax_arm::armv8::a64::Opcode::*;
 use yaxpeax_arm::armv8::a64::{Operand, ShiftStyle, SizeCode};
-use crate::AddressInstDecoder;
 
 use crate::context::{CpuContext, ExecutionReturn, InterruptType, PState};
 use crate::error::Error;
@@ -63,7 +62,7 @@ impl Translator {
             debug: false,
         })
     }
-    
+
     #[inline]
     pub fn set_el(&mut self, el: u8) {
         self.current_el = el;
@@ -100,26 +99,26 @@ impl Translator {
         tctx.translate(insts);
         tctx.finalize();
 
+        let (static_data, dynamic_data) = (tctx.static_data, tctx.dynamic_data);
+
         let mut bcx = tctx.builder;
         bcx.seal_all_blocks();
         bcx.finalize();
-
-        let [static_data, dynamic_data] = tctx.data;
 
         let mut desc_static = DataDescription::new();
         desc_static.define_zeroinit(size_of::<usize>());
         desc_static.set_align(align_of::<usize>() as u64);
 
-        for id in static_data.clone() {
+        for id in static_data {
             self.module.define_data(id, &desc_static).unwrap();
         }
 
-        let mut desc_dynamic = DataDescription::new();
+        if let Some(id) = dynamic_data {
+            let mut desc_dynamic = DataDescription::new();
 
-        desc_dynamic.define_zeroinit(size_of::<DynCache>());
-        desc_dynamic.set_align(align_of::<DynCache>() as u64);
+            desc_dynamic.define_zeroinit(size_of::<DynCache>());
+            desc_dynamic.set_align(align_of::<DynCache>() as u64);
 
-        for id in dynamic_data {
             self.module.define_data(id, &desc_dynamic).unwrap();
         }
 
@@ -157,7 +156,8 @@ impl LoadState {
 pub struct TranslationContext<'a> {
     translator: &'a mut Translator,
     builder: FunctionBuilder<'a>,
-    data: [SmallVec<DataId, 2>; 2],
+    static_data: SmallVec<DataId, 2>,
+    dynamic_data: Option<DataId>,
     cpu_context: Value,
     pc_loadstate: Option<LoadState>,
     gprs_loaded: [Option<LoadState>; 32],
@@ -183,8 +183,6 @@ impl<'a> TranslationContext<'a> {
         mut builder: FunctionBuilder<'a>,
         cpu_context: Value,
     ) -> Self {
-        const INIT: SmallVec<DataId, 2> = SmallVec::new();
-
         // 0..32
         for i in 0..32 {
             builder.declare_var(Variable::from_u32(i), types::I64);
@@ -203,7 +201,8 @@ impl<'a> TranslationContext<'a> {
         Self {
             translator,
             builder,
-            data: [INIT; 2],
+            static_data: SmallVec::new(),
+            dynamic_data: None,
             cpu_context,
             pc_loadstate: None,
             gprs_loaded: [None; 32],
@@ -220,20 +219,20 @@ impl<'a> TranslationContext<'a> {
             if self.translator.debug {
                 eprintln!("{inst}");
             }
-            
+
             let op = inst.opcode;
 
             match op {
                 ADR | ADRP => {
                     let [rd, label, ..] = inst.operands;
-                    
+
                     let label = Self::get_pcoffset(label);
                     let mut pc = self.get_pc();
-                    
-                    if matches!(op, ADRP) { 
+
+                    if matches!(op, ADRP) {
                         pc = self.ins().band_imm(pc, !4095);
                     }
-                    
+
                     let result = self.ins().iadd_imm(pc, label);
                     self.set_operand(rd, result);
                 }
@@ -260,7 +259,7 @@ impl<'a> TranslationContext<'a> {
                                 } else {
                                     s.ins().sadd_overflow(x, y).1
                                 }
-                            }
+                            },
                         );
                     }
                 }
@@ -288,22 +287,22 @@ impl<'a> TranslationContext<'a> {
                                 } else {
                                     s.ins().sadd_overflow(x, y).1
                                 }
-                            }
+                            },
                         );
                     }
                 }
                 AND | ANDS => {
                     let [rd, rn, op2, ..] = inst.operands;
-                    
+
                     let op1 = self.get_operand(rn);
                     let op2 = self.get_operand(op2);
-                    
+
                     let result = self.ins().band(op1, op2);
-                    
-                    if matches!(op, ANDS) { 
+
+                    if matches!(op, ANDS) {
                         self.set_neg_zero(result, Self::get_sizecode(rd));
                     }
-                    
+
                     self.set_operand(rd, result);
                 }
                 BIC | BICS => {
@@ -329,7 +328,7 @@ impl<'a> TranslationContext<'a> {
                     let result = match op {
                         EOR => self.ins().bxor(op1, op2),
                         EON => self.ins().bxor_not(op1, op2),
-                        _ => unreachable!()
+                        _ => unreachable!(),
                     };
 
                     self.set_operand(rd, result);
@@ -343,7 +342,7 @@ impl<'a> TranslationContext<'a> {
                     let result = match op {
                         ORR => self.ins().bor(op1, op2),
                         ORN => self.ins().bor_not(op1, op2),
-                        _ => unreachable!()
+                        _ => unreachable!(),
                     };
 
                     self.set_operand(rd, result);
@@ -355,19 +354,9 @@ impl<'a> TranslationContext<'a> {
                     let addr = self.get_operand(addr);
 
                     if Self::is_wreg(rt) {
-                        self.ins().istore32(
-                            MemFlags::trusted(),
-                            val,
-                            addr,
-                            0
-                        );
+                        self.ins().istore32(MemFlags::trusted(), val, addr, 0);
                     } else {
-                        self.ins().store(
-                            MemFlags::trusted(),
-                            val,
-                            addr,
-                            0
-                        );
+                        self.ins().store(MemFlags::trusted(), val, addr, 0);
                     }
                 }
                 LDR => {
@@ -376,21 +365,11 @@ impl<'a> TranslationContext<'a> {
                     let addr = self.get_operand(addr);
 
                     let val = if Self::is_wreg(rt) {
-                        let val = self.ins().load(
-                            types::I32,
-                            MemFlags::trusted(),
-                            addr,
-                            0
-                        );
+                        let val = self.ins().load(types::I32, MemFlags::trusted(), addr, 0);
 
                         self.ins().uextend(types::I64, val)
                     } else {
-                        self.ins().load(
-                            types::I64,
-                            MemFlags::trusted(),
-                            addr,
-                            0
-                        )
+                        self.ins().load(types::I64, MemFlags::trusted(), addr, 0)
                     };
 
                     self.set_operand(rt, val);
@@ -439,7 +418,7 @@ impl<'a> TranslationContext<'a> {
                         let lr = self.builder.ins().iadd_imm(pc, 4);
                         self.set_gpr(Register::LR, lr);
                     }
-                    
+
                     let [rn, ..] = inst.operands;
                     let target = self.get_operand(rn);
                     self.jump_dynamic(target);
@@ -454,29 +433,29 @@ impl<'a> TranslationContext<'a> {
                     let cond = Condition::from_code(cond as u32);
                     let cond = self.load_cond(cond);
 
-                    let tb = self.builder.create_block();
-                    let fb = self.builder.create_block();
+                    let tb = self.create_block();
+                    let fb = self.create_block();
 
-                    self.builder.ins().brif(cond, tb, &[], fb, &[]);
+                    self.ins().brif(cond, tb, &[], fb, &[]);
                     {
-                        self.builder.switch_to_block(tb);
+                        self.switch_to_block(tb);
 
                         // return here.
                         self.jump_static(label);
                     }
 
-                    self.builder.switch_to_block(fb);
+                    self.switch_to_block(fb);
                 }
                 CBNZ | CBZ => {
                     let [rt, label, ..] = inst.operands;
-                    
+
                     let op1 = self.get_operand(rt);
                     let label = Self::get_pcoffset(label);
-                    
+
                     let cond = match op {
                         CBNZ => self.check_not_zero(op1),
                         CBZ => self.check_zero(op1),
-                        _ => unreachable!()
+                        _ => unreachable!(),
                     };
 
                     let tb = self.builder.create_block();
@@ -552,8 +531,8 @@ impl<'a> TranslationContext<'a> {
                 }
                 _ => unimplemented!("instruction: {inst}"),
             }
-            
-            if self.current_el() >= 1 { 
+
+            if self.current_el() >= 1 {
                 match op {
                     MRS => unimplemented!(),
                     MSR => unimplemented!(),
@@ -568,14 +547,8 @@ impl<'a> TranslationContext<'a> {
     }
 
     pub fn finalize(&mut self) {
-        {
+        if let Some(tc) = self.dynamic_data {
             self.builder.switch_to_block(self.dynamic_block);
-            let tc = self
-                .translator
-                .module
-                .declare_anonymous_data(true, false)
-                .unwrap();
-            self.dynamic_data().push(tc);
             let tc = self
                 .translator
                 .module
@@ -612,12 +585,15 @@ impl<'a> TranslationContext<'a> {
         self.set_pc(target);
         self.save_context();
 
+        // for each branch, we add a new pointer to the data section,
+        // so it would be isolated,
+        // and we don't have to consider the risk of data racing
         let tc = self
             .translator
             .module
             .declare_anonymous_data(true, false)
             .unwrap();
-        self.static_data().push(tc);
+        self.static_data.push(tc);
         let tc = self
             .translator
             .module
@@ -629,12 +605,19 @@ impl<'a> TranslationContext<'a> {
     }
 
     pub fn jump_dynamic(&mut self, dest: Value) {
+        self.dynamic_data.get_or_insert_with(|| {
+            self.translator
+                .module
+                .declare_anonymous_data(true, false)
+                .unwrap()
+        });
+
         self.set_pc(dest);
         self.save_context();
 
         self.builder.ins().jump(self.dynamic_block, &[]);
     }
-    
+
     #[inline]
     pub const fn current_el(&self) -> u8 {
         self.translator.current_el
@@ -655,9 +638,7 @@ impl<'a> TranslationContext<'a> {
 
                 self.builder.ins().iconst(types::I64, result as i64)
             }
-            Operand::Immediate(imm) => {
-                self.ins().iconst(types::I64, imm as i64)
-            }
+            Operand::Immediate(imm) => self.ins().iconst(types::I64, imm as i64),
             Operand::Register(c, id) => {
                 let mut gpr = self.get_gpr(Register::new_with_zr(id as u8));
 
@@ -667,7 +648,7 @@ impl<'a> TranslationContext<'a> {
 
                 gpr
             }
-            Operand::RegShift(s, shift,c,rn) => {
+            Operand::RegShift(s, shift, c, rn) => {
                 let mut rn = self.get_gpr(Register::new_with_zr(rn as u8));
 
                 if matches!(c, SizeCode::W) {
@@ -679,7 +660,7 @@ impl<'a> TranslationContext<'a> {
                     ShiftStyle::LSR => self.ins().ushr_imm(rn, shift as i64),
                     ShiftStyle::ASR => self.ins().sshr_imm(rn, shift as i64),
                     ShiftStyle::ROR => self.ins().rotr_imm(rn, shift as i64),
-                    _ => unimplemented!()
+                    _ => unimplemented!(),
                 }
             }
             Operand::RegisterOrSP(c, id) => {
@@ -749,7 +730,7 @@ impl<'a> TranslationContext<'a> {
     pub fn get_sizecode(operand: Operand) -> SizeCode {
         match operand {
             Operand::Register(s, ..) => s,
-            _ => unimplemented!()
+            _ => unimplemented!(),
         }
     }
 
@@ -928,7 +909,7 @@ impl<'a> TranslationContext<'a> {
             Lt => {
                 let n = self.get_n();
                 let v = self.get_v();
-                
+
                 utils::is_neq(&mut self.builder, n, v)
             }
             Gt => {
@@ -1065,7 +1046,7 @@ impl<'a> TranslationContext<'a> {
     pub fn check_zero(&mut self, val: Value) -> Value {
         self.ins().icmp_imm(IntCC::Equal, val, 0)
     }
-    
+
     pub fn check_not_zero(&mut self, val: Value) -> Value {
         self.ins().icmp_imm(IntCC::NotEqual, val, 0)
     }
@@ -1075,14 +1056,6 @@ impl<'a> TranslationContext<'a> {
         self.set_n(n);
         let z = self.check_zero(val);
         self.set_z(z);
-    }
-
-    pub fn static_data(&mut self) -> &mut SmallVec<DataId, 2> {
-        &mut self.data[0]
-    }
-
-    pub fn dynamic_data(&mut self) -> &mut SmallVec<DataId, 2> {
-        &mut self.data[1]
     }
 }
 
@@ -1141,8 +1114,8 @@ unsafe extern "C" fn lookup_and_jump_dynamic(ctx: *mut CpuContext, data: *mut Dy
     let data = &mut *data;
 
     let target = ctx.pc;
-    
-    if target == 0 { 
+
+    if target == 0 {
         let mut s = ExecutionReturn::new();
         s.set_ty(InterruptType::Udf);
         ctx.status = s.into_u32();
@@ -1151,7 +1124,7 @@ unsafe extern "C" fn lookup_and_jump_dynamic(ctx: *mut CpuContext, data: *mut Dy
 
     // The data contains a pointer to an array
     // which contains the mappings from guest pc to compiled block
-    // lookup from local cache here.
+    // lookup the local cache here.
     for [k, v] in *data {
         if k == target {
             if v == 0 {
@@ -1164,18 +1137,16 @@ unsafe extern "C" fn lookup_and_jump_dynamic(ctx: *mut CpuContext, data: *mut Dy
         }
     }
 
-    // lookup from global cache or translate here.
-
     let gc = translation_cache();
 
+    // lookup the global cache or translate here.
     let block = 'lookup: {
         if let Some(cached) = gc.get(&target) {
             break 'lookup *cached;
         }
 
-        let compiled = TRANSLATOR.with_borrow_mut(|t| t.translate(
-            AddressInstDecoder::new(target as usize)
-        ));
+        let compiled =
+            TRANSLATOR.with_borrow_mut(|t| t.translate(AddressInstDecoder::new(target as usize)));
         gc.insert(target, compiled);
 
         compiled

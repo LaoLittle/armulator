@@ -1,5 +1,5 @@
-use modular_bitfield::BitfieldSpecifier;
 use modular_bitfield::prelude::*;
+use modular_bitfield::BitfieldSpecifier;
 
 #[derive(BitfieldSpecifier, Copy, Clone, Debug, Eq, PartialEq)]
 #[bits = 6]
@@ -72,7 +72,7 @@ pub enum Exception {
     /// Branch Target Identification
     BranchTarget,
     /// FIQ interrupt
-    FIQ
+    FIQ,
 }
 
 #[derive(Copy, Clone)]

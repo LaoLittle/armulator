@@ -1,9 +1,8 @@
+use smallvec::SmallVec;
+use std::collections::{BTreeSet, HashMap};
+
 use crate::inst::Inst;
 use crate::optimizer::SelectInst;
-use smallvec::SmallVec;
-use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap};
-use std::ops::RangeBounds;
 
 pub type BasicBlockMap = HashMap<i64, SmallVec<SelectInst, 32>>;
 
@@ -58,7 +57,6 @@ impl BranchAnalyzer {
 mod tests {
     use crate::block_br::BranchAnalyzer;
     use crate::inst::Inst;
-    use crate::optimizer::SelectInst;
 
     #[test]
     fn test_link() {
