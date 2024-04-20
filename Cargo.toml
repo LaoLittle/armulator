@@ -1,0 +1,21 @@
+[package]
+name = "armulator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dashmap = "5.5.3"
+memoffset = "0.9.1"
+
+smallvec = "2.0.0-alpha.5"
+
+modular-bitfield = "0.11.2"
+
+# jit
+cranelift = "0.106.2"
+cranelift-native = "0.106.2"
+cranelift-jit = "0.106.2"
+cranelift-module = "0.106.2"
+
+yaxpeax-arch = "0.2.7"
+yaxpeax-arm = "0.2.5"
